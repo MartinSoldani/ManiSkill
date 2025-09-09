@@ -21,6 +21,7 @@ from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper
 from mani_skill.utils.wrappers.record import RecordEpisode
 from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 
+
 @dataclass
 class Args:
     exp_name: Optional[str] = None
@@ -47,7 +48,7 @@ class Args:
     """path to a pretrained checkpoint file to start evaluation/training from"""
 
     # Algorithm specific arguments
-    env_id: str = "PickCube-v1"
+    env_id: str = "PullCubeHL-v1"
     """the id of the environment"""
     total_timesteps: int = 10000000
     """total timesteps of the experiments"""
@@ -112,6 +113,11 @@ class Args:
     num_iterations: int = 0
     """the number of iterations (computed in runtime)"""
 
+    # my additions
+    # ---- NEW: P0 evaluation flags ----
+    eval_obs_use_gt_cube: bool = True   # set False to replace cube with HAMSTER 3D estimate at eval
+    eval_obs_use_gt_goal: bool = True   # keep True for P0 (goal stays GT)
+
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
@@ -171,6 +177,39 @@ class Logger:
     def close(self):
         self.writer.close()
 
+
+def _get_first_base_env(obj):
+    """
+    Best-effort unwrapping to reach the first underlying (single) env instance
+    that exposes `set_estimated_cube_from_vlm`.
+    Works when num_eval_envs=1.
+    """
+    seen = set()
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        if id(cur) in seen:
+            continue
+        seen.add(id(cur))
+
+        # If this layer has the method, we’re done
+        if hasattr(cur, "set_estimated_cube_from_vlm"):
+            return cur
+
+        # Common wrapper attributes to unwrap
+        for name in ("unwrapped", "env", "_env", "venv"):
+            nxt = getattr(cur, name, None)
+            if nxt is not None:
+                stack.append(nxt)
+
+        # Vector envs: try first sub-env
+        for name in ("envs", "_envs"):
+            lst = getattr(cur, name, None)
+            if isinstance(lst, (list, tuple)) and len(lst) > 0:
+                stack.append(lst[0])
+    raise RuntimeError("Could not find base env exposing set_estimated_cube_from_vlm. "
+                       "Ensure num_eval_envs=1 and env=PullCubeHamster-v1.")
+
 if __name__ == "__main__":
     args = tyro.cli(Args)
     args.batch_size = int(args.num_envs * args.num_steps)
@@ -192,11 +231,40 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # env setup
-    env_kwargs = dict(obs_mode="state", render_mode="rgb_array", sim_backend="physx_cuda")
+    common_kwargs = dict(obs_mode="state", render_mode="rgb_array", sim_backend="physx_cuda")
     if args.control_mode is not None:
-        env_kwargs["control_mode"] = args.control_mode
-    envs = gym.make(args.env_id, num_envs=args.num_envs if not args.evaluate else 1, reconfiguration_freq=args.reconfiguration_freq, **env_kwargs)
-    eval_envs = gym.make(args.env_id, num_envs=args.num_eval_envs, reconfiguration_freq=args.eval_reconfiguration_freq, **env_kwargs)
+        common_kwargs["control_mode"] = args.control_mode
+        
+    # WE MODIFY THIS PART TO ADD THE NEW ARGS
+    # Train env uses full GT for P0
+    train_kwargs = dict(**common_kwargs)
+    train_kwargs.update(dict(
+        obs_use_gt_cube=True,
+        obs_use_gt_goal=True,
+    ))
+
+    # Eval env can switch GT off just for the cube (P0)
+    eval_kwargs = dict(**common_kwargs)
+    eval_kwargs.update(dict(
+        obs_use_gt_cube=args.eval_obs_use_gt_cube,
+        obs_use_gt_goal=args.eval_obs_use_gt_goal,
+    ))
+
+    envs = gym.make(
+        args.env_id,
+        num_envs=args.num_envs if not args.evaluate else 1,
+        reconfiguration_freq=args.reconfiguration_freq,
+        **train_kwargs
+    )
+    eval_envs = gym.make(
+        args.env_id,
+        num_envs=args.num_eval_envs if not args.evaluate else 1,  # we’ll set 1 for P0
+        reconfiguration_freq=args.eval_reconfiguration_freq,
+        **eval_kwargs
+    )
+        
+    
+    # WE KEEP THIS AS IS
     if isinstance(envs.action_space, gym.spaces.Dict):
         envs = FlattenActionSpaceWrapper(envs)
         eval_envs = FlattenActionSpaceWrapper(eval_envs)
@@ -220,8 +288,8 @@ if __name__ == "__main__":
         if args.track:
             import wandb
             config = vars(args)
-            config["env_cfg"] = dict(**env_kwargs, num_envs=args.num_envs, env_id=args.env_id, reward_mode="normalized_dense", env_horizon=max_episode_steps, partial_reset=args.partial_reset)
-            config["eval_env_cfg"] = dict(**env_kwargs, num_envs=args.num_eval_envs, env_id=args.env_id, reward_mode="normalized_dense", env_horizon=max_episode_steps, partial_reset=False)
+            config["env_cfg"] = dict(**train_kwargs, num_envs=args.num_envs, env_id=args.env_id, reward_mode="normalized_dense", env_horizon=max_episode_steps, partial_reset=args.partial_reset)
+            config["eval_env_cfg"] = dict(**eval_kwargs, num_envs=args.num_eval_envs, env_id=args.env_id, reward_mode="normalized_dense", env_horizon=max_episode_steps, partial_reset=False)
             wandb.init(
                 project=args.wandb_project_name,
                 entity=args.wandb_entity,
@@ -257,6 +325,17 @@ if __name__ == "__main__":
     start_time = time.time()
     next_obs, _ = envs.reset(seed=args.seed)
     eval_obs, _ = eval_envs.reset(seed=args.seed)
+
+    # ---- NEW: P0 injection at reset ----
+    if (not args.eval_obs_use_gt_cube) and (args.num_eval_envs == 1):
+        base_eval_env = _get_first_base_env(eval_envs)
+        # TODO: replace the next line with YOUR real HAMSTER → 3D estimate (torch.Tensor shape [3] or [1,3])
+        cube_3d_est = torch.as_tensor([1.0, 1.0, base_eval_env.cube_half_size], dtype=torch.float32, device="cpu")
+        # If you already have (x,y,z) from HAMSTER, do: cube_3d_est = torch.tensor([x, y, z], dtype=torch.float32)
+        base_eval_env.set_estimated_cube_from_vlm(cube_3d_est)
+
+
+
     next_done = torch.zeros(args.num_envs, device=device)
     print(f"####")
     print(f"args.num_iterations={args.num_iterations} args.num_envs={args.num_envs} args.num_eval_envs={args.num_eval_envs}")
@@ -276,6 +355,15 @@ if __name__ == "__main__":
         if iteration % args.eval_freq == 1:
             print("Evaluating")
             eval_obs, _ = eval_envs.reset()
+
+            # ---- NEW: P0 injection each eval cycle ----
+            if (not args.eval_obs_use_gt_cube) and (args.num_eval_envs == 1):
+                base_eval_env = _get_first_base_env(eval_envs)
+                # TODO: replace with your real HAMSTER → 3D estimate
+                cube_3d_est = torch.as_tensor([1.0, 1.0, base_eval_env.cube_half_size], dtype=torch.float32, device="cpu")
+                base_eval_env.set_estimated_cube_from_vlm(cube_3d_est)
+
+
             eval_metrics = defaultdict(list)
             num_episodes = 0
             for _ in range(args.num_eval_steps):
@@ -286,6 +374,13 @@ if __name__ == "__main__":
                         num_episodes += mask.sum()
                         for k, v in eval_infos["final_info"]["episode"].items():
                             eval_metrics[k].append(v)
+                        # Re-inject for the next episode (num_eval_envs==1 in P0)
+                        if not args.eval_obs_use_gt_cube and args.num_eval_envs == 1:
+                            base_eval_env = _get_first_base_env(eval_envs)
+                            cube_3d_est = torch.tensor([1.0, 1.0, base_eval_env.cube_half_size], dtype=torch.float32)
+                            # ^ replace with your real HAMSTER 3D (x,y,z)
+                            base_eval_env.set_estimated_cube_from_vlm(cube_3d_est)
+
             print(f"Evaluated {args.num_eval_steps * args.num_eval_envs} steps resulting in {num_episodes} episodes")
             for k, v in eval_metrics.items():
                 mean = torch.stack(v).float().mean()
