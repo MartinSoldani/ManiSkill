@@ -4,6 +4,7 @@ import random
 import time
 from dataclasses import dataclass
 from typing import Optional
+import math
 
 import gymnasium as gym
 import numpy as np
@@ -20,6 +21,34 @@ from mani_skill.utils import gym_utils
 from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper
 from mani_skill.utils.wrappers.record import RecordEpisode
 from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
+
+
+
+
+# Hamster specific imports
+
+# maniskill stuff
+import sapien
+from mani_skill.utils.structs.pose import Pose
+from transforms3d.euler import euler2quat
+
+# === HAMSTER VLM client ===
+from hamster_client_server import (
+    HamsterVLMHTTP,
+    get_camera_rgb_from_env,
+    make_snapshot_path,
+    save_annotated_image,
+    save_local_annotated_from_sketch,
+)
+
+# === HAMSTER 2D->3D helpers ===
+from hamster_2D_to_3D import (
+    vlm_uv_to_world_points_from_env,
+    extract_cube_goal_from_world_points,
+    set_vlm_hl_path_on_env,    # optional (debug markers + HL path)
+    inject_cube_estimate_p0,   # tiny convenience wrapper
+    _has_points,
+)
 
 
 @dataclass
@@ -48,7 +77,7 @@ class Args:
     """path to a pretrained checkpoint file to start evaluation/training from"""
 
     # Algorithm specific arguments
-    env_id: str = "PullCubeHL-v1"
+    env_id: str = "PullCubeHamster-v1"
     """the id of the environment"""
     total_timesteps: int = 10000000
     """total timesteps of the experiments"""
@@ -117,6 +146,9 @@ class Args:
     # ---- NEW: P0 evaluation flags ----
     eval_obs_use_gt_cube: bool = True   # set False to replace cube with HAMSTER 3D estimate at eval
     eval_obs_use_gt_goal: bool = True   # keep True for P0 (goal stays GT)
+
+    # HAMSTER INSTRUCTIONS
+    instruction_hamster: str = "Pull the blue cube to the goal. Make sure to place the gripper in front of the cube first so that there is enough space to push the cube to the goal using the end effector."
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
@@ -210,6 +242,27 @@ def _get_first_base_env(obj):
     raise RuntimeError("Could not find base env exposing set_estimated_cube_from_vlm. "
                        "Ensure num_eval_envs=1 and env=PullCubeHamster-v1.")
 
+
+def _hide_all_markers(env):
+    u = env.unwrapped
+    try:
+        import sapien
+    except Exception:
+        sapien = None
+
+    def _offscreen_pose():
+        # shove far below the table so it never appears
+        return sapien.Pose(p=[10, 10, -10]) if sapien else None
+
+    if getattr(u, "_cube_marker", None) is not None:
+        if sapien: u._cube_marker.set_pose(_offscreen_pose())
+    if getattr(u, "_goal_marker", None) is not None:
+        if sapien: u._goal_marker.set_pose(_offscreen_pose())
+    if getattr(u, "_waypoint_markers", None):
+        for a in u._waypoint_markers:
+            if sapien: a.set_pose(_offscreen_pose())
+
+
 if __name__ == "__main__":
     args = tyro.cli(Args)
     args.batch_size = int(args.num_envs * args.num_steps)
@@ -281,6 +334,43 @@ if __name__ == "__main__":
     eval_envs = ManiSkillVectorEnv(eval_envs, args.num_eval_envs, ignore_terminations=not args.eval_partial_reset, record_metrics=True)
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
+    # ADD NEW: a separate env for camera images if needed
+    sensor_env = None
+    if args.evaluate:
+        # A separate, single env for grabbing camera images/depth
+        sensor_kwargs = dict(obs_mode="rgbd", render_mode="rgb_array", sim_backend="physx_cuda")
+        if args.control_mode is not None:
+            sensor_kwargs["control_mode"] = args.control_mode
+        sensor_env = gym.make(args.env_id, num_envs=1, reconfiguration_freq=args.eval_reconfiguration_freq, **sensor_kwargs)
+        # IMPORTANT: do NOT vector-wrap sensor_env. We want direct access to unwrapped.
+        _ = sensor_env.reset()  # initialize sensors
+
+    def _sync_objects_to_sensor_env(base_env, sensor_env):
+        """
+        Copy cube and goal poses from the real eval env to the sensor-tap env
+        so the camera sees the same scene for this episode.
+        """
+        # Pull poses from the real eval env
+        cube_pose = base_env.obj.pose  # Pose struct with .p (B,3) or (3,)
+        goal_pose = base_env.goal_region.pose
+
+        # Some builds store batched poses; select [0] if needed
+        cube_p = cube_pose.p[0].detach().cpu().numpy() if getattr(cube_pose.p, "ndim", 1) == 2 else cube_pose.p
+        goal_p = goal_pose.p[0].detach().cpu().numpy() if getattr(goal_pose.p, "ndim", 1) == 2 else goal_pose.p
+
+        # Set in the sensor env
+        sensor_env.unwrapped.obj.set_pose(Pose.create_from_pq(p=cube_p, q=[1,0,0,0]))
+        sensor_env.unwrapped.goal_region.set_pose(Pose.create_from_pq(p=goal_p, q=euler2quat(0, np.pi/2, 0)))
+
+    # === HAMSTER VLM client helper ===
+    vlm_client = None
+    snap_root = None
+    if args.evaluate:
+        vlm_client = HamsterVLMHTTP()  # or HamsterVLMHTTP(base_url="http://127.0.0.1:8000")
+        # snapshot folder under the run dir
+        run_dir = f"{os.path.dirname(args.checkpoint)}"
+        snap_root = os.path.join(run_dir, "snapshots")
+
     max_episode_steps = gym_utils.find_max_episode_steps_value(envs._env)
     logger = None
     if not args.evaluate:
@@ -320,19 +410,95 @@ if __name__ == "__main__":
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
 
+    # === HAMSTER VLM calls - episode counter ===
+    # how many episodes do we intend to evaluate this pass?
+    horizon = max_episode_steps  # you already computed this earlier
+    target_eps = args.num_eval_steps // horizon
+    # If you ever want to allow a partial last episode, use ceil instead:
+    # target_eps = math.ceil(args.num_eval_steps / horizon)
+
+    injections_done = 0
+
     # TRY NOT TO MODIFY: start the game
     global_step = 0
     start_time = time.time()
     next_obs, _ = envs.reset(seed=args.seed)
     eval_obs, _ = eval_envs.reset(seed=args.seed)
 
-    # ---- NEW: P0 injection at reset ----
-    if (not args.eval_obs_use_gt_cube) and (args.num_eval_envs == 1):
-        base_eval_env = _get_first_base_env(eval_envs)
-        # TODO: replace the next line with YOUR real HAMSTER → 3D estimate (torch.Tensor shape [3] or [1,3])
-        cube_3d_est = torch.as_tensor([1.0, 1.0, base_eval_env.cube_half_size], dtype=torch.float32, device="cpu")
-        # If you already have (x,y,z) from HAMSTER, do: cube_3d_est = torch.tensor([x, y, z], dtype=torch.float32)
-        base_eval_env.set_estimated_cube_from_vlm(cube_3d_est)
+    # ---- NEW: P0 injection at reset ---- this worked before 
+    # if (not args.eval_obs_use_gt_cube) and (args.num_eval_envs == 1):
+    #     base_eval_env = _get_first_base_env(eval_envs)
+    #     # TODO: replace the next line with YOUR real HAMSTER → 3D estimate (torch.Tensor shape [3] or [1,3])
+    #     cube_3d_est = torch.as_tensor([1.0, 1.0, base_eval_env.cube_half_size], dtype=torch.float32, device="cpu")
+    #     # If you already have (x,y,z) from HAMSTER, do: cube_3d_est = torch.tensor([x, y, z], dtype=torch.float32)
+    #     base_eval_env.set_estimated_cube_from_vlm(cube_3d_est)
+
+    # TEST: COMMENT OUT FOR NOW AS TOO MANY HAMSTER CALLS OTHERWISE
+    # # ---- HAMSTER injection (P0) after first eval reset ----
+    # if (not args.eval_obs_use_gt_cube) and (args.num_eval_envs == 1) and (sensor_env is not None):
+    #     base_eval_env = _get_first_base_env(eval_envs)
+
+    #     # 1) Mirror the episode scene into the sensor tap (NO reset afterwards)
+    #     _sync_objects_to_sensor_env(base_eval_env, sensor_env)
+
+    #     # 2) Grab a frame from base_camera_1 and save it
+    #     rgb = get_camera_rgb_from_env(sensor_env, cam_name="base_camera_1")
+    #     snap_path = make_snapshot_path(snap_root, prefix="ep_start")
+
+    #     # 3) Ask Hamster for the 2D path using THIS snapshot; the client saves exactly what it sends
+    #     instruction = args.instruction_hamster  # TODO: make CLI arg if desired
+    #     sketch = vlm_client.get_path(
+    #         rgb,
+    #         instruction,
+    #         resize_to=(512, 512),   # must match what you’ll use for back-projection
+    #         save_to=snap_path,      # .../snapshots/ep_start_YYYYMMDD_HHMMSS.png
+    #         return_image=True,
+    #     )
+    #     uv_coords = [(wp.u, wp.v) for wp in sketch.waypoints]
+    #     vlm_size = tuple(sketch.meta["vlm_image_size"])  # (W,H), e.g. (512,512)
+
+    #     if len(uv_coords) == 0:
+    #         print("[VLM] No waypoints returned; skipping injection this episode.")
+    #     else:
+    #         # 4) Convert UV->3D using the SAME camera frame you mirrored
+    #         #    (Fetch the rich obs dict WITHOUT resetting.)
+    #         obs_dict = (
+    #             getattr(sensor_env.unwrapped, "get_obs", None)
+    #             or getattr(sensor_env.unwrapped, "get_observation", None)
+    #             or getattr(sensor_env.unwrapped, "_get_obs", None)
+    #         )()
+    #         pts_3d = vlm_uv_to_world_points_from_env(
+    #             obs=obs_dict,
+    #             uv_coords_norm=uv_coords,
+    #             vlm_image_size=vlm_size,      # MUST match the size sent to Hamster
+    #             cam_name="base_camera_1",
+    #         )
+
+    #         # 5) Extract endpoints and inject cube estimate (P0)
+    #         tcp_world = base_eval_env.agent.tcp.pose.p[0].detach().cpu().numpy()
+    #         cube_pos, goal_pos = extract_cube_goal_from_world_points(
+    #             pts_3d, tcp_world=tcp_world, endpoint_strategy="first_last"
+    #         )
+    #         if cube_pos is not None:
+    #             inject_cube_estimate_p0(base_eval_env, cube_pos)
+    #             base_eval_env.unwrapped.show_cube_marker(cube_pos)  # marker moves to estimate
+    #         if goal_pos is not None:
+    #             base_eval_env.unwrapped.show_goal_marker(goal_pos)
+    #         if _has_points(pts_3d):
+    #             base_eval_env.unwrapped.set_waypoint_markers(pts_3d)
+
+    #     # (Optional) save annotated image if server returned one
+    #     anno_path = snap_path.replace(".png", "_annotated.png")
+    #     ok = save_local_annotated_from_sketch(
+    #         snapshot_path=snap_path,   # this is exactly what we sent (512x512)
+    #         sketch=sketch,             # contains the waypoints we parsed
+    #         out_path=anno_path,
+    #         quest=instruction,         # optional label in the top-left corner
+    #     )
+    #     if not ok:
+    #         print("[VLM] No annotated image could be generated (no waypoints or missing snapshot).")
+
+
 
 
 
@@ -356,12 +522,81 @@ if __name__ == "__main__":
             print("Evaluating")
             eval_obs, _ = eval_envs.reset()
 
-            # ---- NEW: P0 injection each eval cycle ----
-            if (not args.eval_obs_use_gt_cube) and (args.num_eval_envs == 1):
+            # ---- NEW: P0 injection each eval cycle ---- workeed beofre
+            # if (not args.eval_obs_use_gt_cube) and (args.num_eval_envs == 1):
+            #     base_eval_env = _get_first_base_env(eval_envs)
+            #     # TODO: replace with your real HAMSTER → 3D estimate
+            #     cube_3d_est = torch.as_tensor([1.0, 1.0, base_eval_env.cube_half_size], dtype=torch.float32, device="cpu")
+            #     base_eval_env.set_estimated_cube_from_vlm(cube_3d_est)
+
+            # ---- HAMSTER injection (P0) each periodic eval reset ----
+            if (not args.eval_obs_use_gt_cube) and (args.num_eval_envs == 1) and (sensor_env is not None):
                 base_eval_env = _get_first_base_env(eval_envs)
-                # TODO: replace with your real HAMSTER → 3D estimate
-                cube_3d_est = torch.as_tensor([1.0, 1.0, base_eval_env.cube_half_size], dtype=torch.float32, device="cpu")
-                base_eval_env.set_estimated_cube_from_vlm(cube_3d_est)
+
+                # 1) Mirror the episode scene into the sensor tap (NO reset afterwards)
+                _sync_objects_to_sensor_env(base_eval_env, sensor_env)
+                _hide_all_markers(sensor_env)
+
+                # 2) Grab a frame from base_camera_1 and save it
+                rgb = get_camera_rgb_from_env(sensor_env, cam_name="base_camera_1")
+                snap_path = make_snapshot_path(snap_root, prefix="ep_start")
+
+                # 3) Ask Hamster for the 2D path using THIS snapshot; the client saves exactly what it sends
+                instruction = args.instruction_hamster  # TODO: make CLI arg if desired
+                sketch = vlm_client.get_path(
+                    rgb,
+                    instruction,
+                    resize_to=(512, 512),   # must match what you’ll use for back-projection
+                    save_to=snap_path,      # .../snapshots/ep_start_YYYYMMDD_HHMMSS.png
+                    return_image=True,
+                )
+                uv_coords = [(wp.u, wp.v) for wp in sketch.waypoints]
+                vlm_size = tuple(sketch.meta["vlm_image_size"])  # (W,H), e.g. (512,512)
+
+                if len(uv_coords) == 0:
+                    print("[VLM] No waypoints returned; skipping injection this episode.")
+                else:
+                    # 4) Convert UV->3D using the SAME camera frame you mirrored
+                    #    (Fetch the rich obs dict WITHOUT resetting.)
+                    obs_dict = (
+                        getattr(sensor_env.unwrapped, "get_obs", None)
+                        or getattr(sensor_env.unwrapped, "get_observation", None)
+                        or getattr(sensor_env.unwrapped, "_get_obs", None)
+                    )()
+                    pts_3d = vlm_uv_to_world_points_from_env(
+                        obs=obs_dict,
+                        uv_coords_norm=uv_coords,
+                        vlm_image_size=vlm_size,      # MUST match the size sent to Hamster
+                        cam_name="base_camera_1",
+                    )
+
+                    # 5) Extract endpoints and inject cube estimate (P0)
+                    tcp_world = base_eval_env.agent.tcp.pose.p[0].detach().cpu().numpy()
+                    cube_pos, goal_pos = extract_cube_goal_from_world_points(
+                        pts_3d, tcp_world=tcp_world, endpoint_strategy="first_last"
+                    )
+                    if cube_pos is not None:
+                        inject_cube_estimate_p0(base_eval_env, cube_pos)
+                        base_eval_env.unwrapped.show_cube_marker(cube_pos)  # marker moves to estimate
+                    if goal_pos is not None:
+                        base_eval_env.unwrapped.show_goal_marker(goal_pos)
+                    if _has_points(pts_3d):
+                        base_eval_env.unwrapped.set_waypoint_markers(pts_3d)
+
+                # (Optional) save annotated image if server returned one
+                anno_path = snap_path.replace(".png", "_annotated.png")
+                ok = save_local_annotated_from_sketch(
+                    snapshot_path=snap_path,   # this is exactly what we sent (512x512)
+                    sketch=sketch,             # contains the waypoints we parsed
+                    out_path=anno_path,
+                    quest=instruction,         # optional label in the top-left corner
+                )
+                if not ok:
+                    print("[VLM] No annotated image could be generated (no waypoints or missing snapshot).")
+
+                injections_done += 1
+
+                            
 
 
             eval_metrics = defaultdict(list)
@@ -374,12 +609,76 @@ if __name__ == "__main__":
                         num_episodes += mask.sum()
                         for k, v in eval_infos["final_info"]["episode"].items():
                             eval_metrics[k].append(v)
-                        # Re-inject for the next episode (num_eval_envs==1 in P0)
-                        if not args.eval_obs_use_gt_cube and args.num_eval_envs == 1:
-                            base_eval_env = _get_first_base_env(eval_envs)
-                            cube_3d_est = torch.tensor([1.0, 1.0, base_eval_env.cube_half_size], dtype=torch.float32)
-                            # ^ replace with your real HAMSTER 3D (x,y,z)
-                            base_eval_env.set_estimated_cube_from_vlm(cube_3d_est)
+
+                        if injections_done < target_eps:
+                            # # comment out for now as too many calls
+                            # Re-inject a new HAMSTER estimate for the next episode (num_eval_envs==1 in P0)
+                            if (not args.eval_obs_use_gt_cube) and (args.num_eval_envs == 1) and (sensor_env is not None):
+                                base_eval_env = _get_first_base_env(eval_envs)
+
+                                # 1) Mirror the episode scene into the sensor tap (NO reset afterwards)
+                                _sync_objects_to_sensor_env(base_eval_env, sensor_env)
+                                _hide_all_markers(sensor_env)
+
+                                # 2) Grab a frame from base_camera_1 and save it
+                                rgb = get_camera_rgb_from_env(sensor_env, cam_name="base_camera_1")
+                                snap_path = make_snapshot_path(snap_root, prefix="ep_start")
+
+                                # 3) Ask Hamster for the 2D path using THIS snapshot; the client saves exactly what it sends
+                                instruction = args.instruction_hamster  # TODO: make CLI arg if desired
+                                sketch = vlm_client.get_path(
+                                    rgb,
+                                    instruction,
+                                    resize_to=(512, 512),   # must match what you’ll use for back-projection
+                                    save_to=snap_path,      # .../snapshots/ep_start_YYYYMMDD_HHMMSS.png
+                                    return_image=True,
+                                )
+                                uv_coords = [(wp.u, wp.v) for wp in sketch.waypoints]
+                                vlm_size = tuple(sketch.meta["vlm_image_size"])  # (W,H), e.g. (512,512)
+
+                                if len(uv_coords) == 0:
+                                    print("[VLM] No waypoints returned; skipping injection this episode.")
+                                else:
+                                    # 4) Convert UV->3D using the SAME camera frame you mirrored
+                                    #    (Fetch the rich obs dict WITHOUT resetting.)
+                                    obs_dict = (
+                                        getattr(sensor_env.unwrapped, "get_obs", None)
+                                        or getattr(sensor_env.unwrapped, "get_observation", None)
+                                        or getattr(sensor_env.unwrapped, "_get_obs", None)
+                                    )()
+                                    pts_3d = vlm_uv_to_world_points_from_env(
+                                        obs=obs_dict,
+                                        uv_coords_norm=uv_coords,
+                                        vlm_image_size=vlm_size,      # MUST match the size sent to Hamster
+                                        cam_name="base_camera_1",
+                                    )
+
+                                    # 5) Extract endpoints and inject cube estimate (P0)
+                                    tcp_world = base_eval_env.agent.tcp.pose.p[0].detach().cpu().numpy()
+                                    cube_pos, goal_pos = extract_cube_goal_from_world_points(
+                                        pts_3d, tcp_world=tcp_world, endpoint_strategy="first_last"
+                                    )
+                                    if cube_pos is not None:
+                                        inject_cube_estimate_p0(base_eval_env, cube_pos)
+                                        base_eval_env.unwrapped.show_cube_marker(cube_pos)  # marker moves to estimate
+                                    if goal_pos is not None:
+                                        base_eval_env.unwrapped.show_goal_marker(goal_pos)
+                                    if _has_points(pts_3d):
+                                        base_eval_env.unwrapped.set_waypoint_markers(pts_3d)
+
+                                # (Optional) save annotated image if server returned one
+                                anno_path = snap_path.replace(".png", "_annotated.png")
+                                ok = save_local_annotated_from_sketch(
+                                    snapshot_path=snap_path,   # this is exactly what we sent (512x512)
+                                    sketch=sketch,             # contains the waypoints we parsed
+                                    out_path=anno_path,
+                                    quest=instruction,         # optional label in the top-left corner
+                                )
+                                if not ok:
+                                    print("[VLM] No annotated image could be generated (no waypoints or missing snapshot).")
+                                
+                                injections_done += 1
+
 
             print(f"Evaluated {args.num_eval_steps * args.num_eval_envs} steps resulting in {num_episodes} episodes")
             for k, v in eval_metrics.items():
@@ -563,3 +862,4 @@ if __name__ == "__main__":
         logger.close()
     envs.close()
     eval_envs.close()
+ 
