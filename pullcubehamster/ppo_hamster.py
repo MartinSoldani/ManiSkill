@@ -143,12 +143,14 @@ class Args:
     """the number of iterations (computed in runtime)"""
 
     # my additions
+    vlm_cam_name: str = "hamster_camera"
+
     # ---- NEW: P0 evaluation flags ----
     eval_obs_use_gt_cube: bool = True   # set False to replace cube with HAMSTER 3D estimate at eval
     eval_obs_use_gt_goal: bool = True   # keep True for P0 (goal stays GT)
 
     # HAMSTER INSTRUCTIONS
-    instruction_hamster: str = "Pull the blue cube to the goal. Make sure to place the gripper in front of the cube first so that there is enough space to push the cube to the goal using the end effector."
+    instruction_hamster: str = "Push the blue cube to the goal area. Push the cube from its left side to the right."
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
@@ -301,6 +303,11 @@ if __name__ == "__main__":
     eval_kwargs.update(dict(
         obs_use_gt_cube=args.eval_obs_use_gt_cube,
         obs_use_gt_goal=args.eval_obs_use_gt_goal,
+        ham_cam_name=args.vlm_cam_name,           # <- optional: override defaults
+        # ham_cam_res=512,
+        # ham_cam_fov_deg=55.0,
+        # ham_cam_eye=(0.40,0.50,0.55),
+        # ham_cam_target=(0.00,0.00,0.35),
     ))
 
     envs = gym.make(
@@ -442,7 +449,7 @@ if __name__ == "__main__":
     #     _sync_objects_to_sensor_env(base_eval_env, sensor_env)
 
     #     # 2) Grab a frame from base_camera_1 and save it
-    #     rgb = get_camera_rgb_from_env(sensor_env, cam_name="base_camera_1")
+    #     rgb = get_camera_rgb_from_env(sensor_env, cam_name=args.vlm_cam_name)
     #     snap_path = make_snapshot_path(snap_root, prefix="ep_start")
 
     #     # 3) Ask Hamster for the 2D path using THIS snapshot; the client saves exactly what it sends
@@ -471,7 +478,7 @@ if __name__ == "__main__":
     #             obs=obs_dict,
     #             uv_coords_norm=uv_coords,
     #             vlm_image_size=vlm_size,      # MUST match the size sent to Hamster
-    #             cam_name="base_camera_1",
+    #             cam_name=args.vlm_cam_name,
     #         )
 
     #         # 5) Extract endpoints and inject cube estimate (P0)
@@ -522,6 +529,9 @@ if __name__ == "__main__":
             print("Evaluating")
             eval_obs, _ = eval_envs.reset()
 
+
+
+
             # ---- NEW: P0 injection each eval cycle ---- workeed beofre
             # if (not args.eval_obs_use_gt_cube) and (args.num_eval_envs == 1):
             #     base_eval_env = _get_first_base_env(eval_envs)
@@ -538,7 +548,7 @@ if __name__ == "__main__":
                 _hide_all_markers(sensor_env)
 
                 # 2) Grab a frame from base_camera_1 and save it
-                rgb = get_camera_rgb_from_env(sensor_env, cam_name="base_camera_1")
+                rgb = get_camera_rgb_from_env(sensor_env, cam_name=args.vlm_cam_name)
                 snap_path = make_snapshot_path(snap_root, prefix="ep_start")
 
                 # 3) Ask Hamster for the 2D path using THIS snapshot; the client saves exactly what it sends
@@ -567,7 +577,7 @@ if __name__ == "__main__":
                         obs=obs_dict,
                         uv_coords_norm=uv_coords,
                         vlm_image_size=vlm_size,      # MUST match the size sent to Hamster
-                        cam_name="base_camera_1",
+                        cam_name=args.vlm_cam_name,
                     )
 
                     # 5) Extract endpoints and inject cube estimate (P0)
@@ -604,6 +614,12 @@ if __name__ == "__main__":
             for _ in range(args.num_eval_steps):
                 with torch.no_grad():
                     eval_obs, eval_rew, eval_terminations, eval_truncations, eval_infos = eval_envs.step(agent.get_action(eval_obs, deterministic=True))
+                    # debug print
+                    if args.evaluate:
+                        tcp_xy = base_eval_env.unwrapped.agent.tcp.pose.p[0, :2].cpu().numpy()
+                        goal_xy = base_eval_env.unwrapped.goal_region.pose.p[0, :2].cpu().numpy()
+                        print("tcp→goal dist @t0:", np.linalg.norm(tcp_xy - goal_xy))
+
                     if "final_info" in eval_infos:
                         mask = eval_infos["_final_info"]
                         num_episodes += mask.sum()
@@ -621,7 +637,7 @@ if __name__ == "__main__":
                                 _hide_all_markers(sensor_env)
 
                                 # 2) Grab a frame from base_camera_1 and save it
-                                rgb = get_camera_rgb_from_env(sensor_env, cam_name="base_camera_1")
+                                rgb = get_camera_rgb_from_env(sensor_env, cam_name=args.vlm_cam_name)
                                 snap_path = make_snapshot_path(snap_root, prefix="ep_start")
 
                                 # 3) Ask Hamster for the 2D path using THIS snapshot; the client saves exactly what it sends
@@ -650,7 +666,7 @@ if __name__ == "__main__":
                                         obs=obs_dict,
                                         uv_coords_norm=uv_coords,
                                         vlm_image_size=vlm_size,      # MUST match the size sent to Hamster
-                                        cam_name="base_camera_1",
+                                        cam_name=args.vlm_cam_name,
                                     )
 
                                     # 5) Extract endpoints and inject cube estimate (P0)
